@@ -1,0 +1,858 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Healthcare Appointment Demo (Single File)</title>
+
+  <!-- React + ReactDOM + Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Leaflet + MarkerCluster -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+  <style>
+    html,body,#root { height:100%; }
+    .neon { text-shadow: 0 0 8px rgba(255,255,255,0.6); }
+    .leaflet-container { height: 360px; width: 100%; border-radius: 8px; }
+  </style>
+</head>
+<body class="bg-gradient-to-bl from-blue-50 via-white to-pink-50">
+
+<div id="root"></div>
+
+<script type="text/babel">
+
+/* -------------------------
+   Mock DB + Utilities
+   ------------------------- */
+
+const MOCK = {
+  // sample Aadhaar -> DOB map for demo elder detection
+  aadhaarMap: {
+    "111122223333": "1945-03-12", // elderly
+    "222233334444": "1990-07-20",
+    "333344445555": "1950-01-10"  // elderly
+  },
+  sampleHospitals: [
+    { id: 'h1', name: 'Metro General Hospital', lat: 12.9716, lng: 77.5946, address: 'MG Road' },
+    { id: 'h2', name: 'City Care Clinic', lat: 12.9750, lng: 77.5960, address: 'Church Street' },
+    { id: 'h3', name: 'Sunrise Medical Center', lat: 12.9611, lng: 77.6387, address: 'OLD Town' },
+  ],
+  sampleDoctors: [
+    { id:'d1', name:'Dr. Asha Rao', hospitalId:'h1', specialization:'General Physician', slots: generateSlots() },
+    { id:'d2', name:'Dr. Rohit Kumar', hospitalId:'h2', specialization:'Cardiologist', slots: generateSlots() },
+    { id:'d3', name:'Dr. Meera Iyer', hospitalId:'h1', specialization:'Geriatrician', slots: generateSlots() },
+  ],
+  sampleDonors: [
+    { id:'don1', name:'Ramesh', blood:'A+', location:'MG Road', available:true },
+    { id:'don2', name:'Sita', blood:'B+', location:'Church Street', available:true },
+    { id:'don3', name:'Arun', blood:'O-', location:'OLD Town', available:false },
+  ],
+  sampleUsers: [
+    // patient elderly
+    { id:'u_patient1', email:'patient1@example.com', password:'password', name:'Mr Elder', role:'patient', aadhaar:'111122223333' },
+    { id:'u_patient2', email:'patient2@example.com', password:'password', name:'Young Patient', role:'patient', aadhaar:'222233334444' },
+    { id:'u_doctor1', email:'doctor1@example.com', password:'password', name:'Dr. Asha Rao', role:'doctor', doctorId:'d1' },
+    { id:'u_admin', email:'admin@example.com', password:'password', name:'Site Admin', role:'admin' },
+  ],
+};
+
+// Helper: generate mock available slots for next 7 days
+function generateSlots() {
+  const slots = {};
+  const today = new Date();
+  for (let d=0; d<7; d++){
+    const date = new Date(today);
+    date.setDate(today.getDate()+d);
+    const key = date.toISOString().slice(0,10);
+    slots[key] = ['09:00','10:00','11:30','14:00','15:30']; // sample times
+  }
+  return slots;
+}
+
+// Local DB stored in localStorage key 'hc_demo_db'
+function initDB(){
+  if (!localStorage.getItem('hc_demo_db')){
+    const db = {
+      users: MOCK.sampleUsers.slice(),
+      hospitals: MOCK.sampleHospitals.slice(),
+      doctors: MOCK.sampleDoctors.slice(),
+      donors: MOCK.sampleDonors.slice(),
+      appointments: [],
+      reviews: [], // {id, userId, targetType: 'hospital'|'doctor', targetId, rating, text, date}
+    };
+    localStorage.setItem('hc_demo_db', JSON.stringify(db));
+  }
+}
+function db(){ return JSON.parse(localStorage.getItem('hc_demo_db')); }
+function setDB(d){ localStorage.setItem('hc_demo_db', JSON.stringify(d)); }
+
+/* JWT simulation (in-browser only) */
+function signToken(payload, expiresInSeconds=3600){
+  const token = btoa(JSON.stringify({...payload, exp: Date.now()+expiresInSeconds*1000}));
+  return token;
+}
+function verifyToken(token){
+  try {
+    const obj = JSON.parse(atob(token));
+    if (obj.exp > Date.now()) return obj;
+    return null;
+  } catch(e){ return null; }
+}
+
+/* Utility helpers */
+function uid(prefix='id'){ return prefix + '_' + Math.random().toString(36).slice(2,9); }
+function daysFromNowISO(n){ const d=new Date(); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); }
+function calcAge(dobISO){
+  const bd = new Date(dobISO);
+  const diff = Date.now() - bd.getTime();
+  return Math.floor(diff / (1000*3600*24*365.25));
+}
+
+/* Initialize DB */
+initDB();
+
+/* -------------------------
+   React App
+   ------------------------- */
+
+const { useState, useEffect, useRef, createContext, useContext } = React;
+
+/* Auth Context */
+const AuthContext = createContext();
+
+function AuthProvider({children}){
+  const [user, setUser] = useState(()=> {
+    const token = localStorage.getItem('hc_token');
+    const obj = token ? verifyToken(token) : null;
+    if (obj) {
+      // fetch full user from db
+      const d = db();
+      const u = d.users.find(x=>x.email===obj.email);
+      return u ? {...u, token} : null;
+    }
+    return null;
+  });
+  function login(email, password){
+    const d = db();
+    const u = d.users.find(x=>x.email===email && x.password===password);
+    if (!u) return { ok:false, message:'Invalid credentials' };
+    const t = signToken({ email:u.email, role:u.role }, 60*60*2);
+    localStorage.setItem('hc_token', t);
+    setUser({...u, token:t});
+    return { ok:true, user:u };
+  }
+  function signup({name,email,password,role,aadhaar,doctorId}){
+    const d = db();
+    if (d.users.find(x=>x.email===email)) return { ok:false, message:'Email exists' };
+    const newUser = { id: uid('u'), name, email, password, role, aadhaar, doctorId };
+    d.users.push(newUser);
+    setDB(d);
+    const t = signToken({ email:newUser.email, role:newUser.role }, 60*60*2);
+    localStorage.setItem('hc_token', t);
+    setUser({...newUser, token:t});
+    return { ok:true, user:newUser };
+  }
+  function logout(){
+    localStorage.removeItem('hc_token');
+    setUser(null);
+  }
+  return <AuthContext.Provider value={{ user, login, signup, logout }}>{children}</AuthContext.Provider>;
+}
+function useAuth(){ return useContext(AuthContext); }
+
+/* Top-level App */
+function App(){
+  return (
+    <AuthProvider>
+      <Main />
+    </AuthProvider>
+  );
+}
+
+/* Main container */
+function Main(){
+  const { user, logout } = useAuth();
+  return (
+    <div className="min-h-screen flex flex-col">
+      <Header />
+      <div className="flex-1 container mx-auto p-4">
+        { user ? <Dashboard /> : <Landing /> }
+      </div>
+      <Footer />
+    </div>
+  );
+}
+
+/* Header */
+function Header(){
+  const { user, logout } = useAuth();
+  return (
+    <header className="bg-white/80 backdrop-blur p-4 shadow-sm">
+      <div className="container mx-auto flex items-center justify-between">
+        <div className="flex items-center space-x-3">
+          <div className="text-2xl font-bold neon">HealthHack</div>
+          <div className="text-sm text-gray-600">Healthcare App Demo</div>
+        </div>
+        <div>
+          { user ? (
+            <div className="flex items-center space-x-3">
+              <div className="text-sm">Hello, <strong>{user.name}</strong> ({user.role})</div>
+              <button onClick={logout} className="px-3 py-1 rounded bg-red-500 text-white text-sm">Logout</button>
+            </div>
+          ) : null }
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/* Footer */
+function Footer(){
+  return (
+    <footer className="text-center py-4 text-xs text-gray-600">
+      Demo app • Single-file hackathon-ready • Data stored in browser localStorage
+    </footer>
+  );
+}
+
+/* Landing (Login/Signup) */
+function Landing(){
+  const [mode, setMode] = useState('login');
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <div className="p-6 bg-white rounded shadow">
+        <h2 className="text-xl font-semibold mb-2">Welcome to HealthHack</h2>
+        <p className="text-sm text-gray-600 mb-4">A single-file demo of a healthcare appointment system — signup to try features.</p>
+        <AuthForm mode={mode} setMode={setMode} />
+      </div>
+      <div className="p-6 bg-white rounded shadow">
+        <h3 className="font-semibold mb-2">Demo Accounts & Tips</h3>
+        <ul className="text-sm list-disc ml-5">
+          <li>Patient elderly: patient1@example.com / password</li>
+          <li>Patient young: patient2@example.com / password</li>
+          <li>Doctor: doctor1@example.com / password</li>
+          <li>Admin: admin@example.com / password</li>
+        </ul>
+        <div className="mt-4">
+          <h4 className="font-semibold">Quick features</h4>
+          <p className="text-sm text-gray-600">Book appointments, check map crowd levels, leave ratings, run chatbot, search donors, schedule home visits for 75+ patients.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* AuthForm */
+function AuthForm({mode, setMode}){
+  const { login, signup } = useAuth();
+  const [form, setForm] = useState({ email:'', password:'', name:'', role:'patient', aadhaar:'' });
+  const [msg, setMsg] = useState(null);
+
+  function handleSubmit(e){
+    e.preventDefault();
+    setMsg(null);
+    if (mode==='login'){
+      const res = login(form.email, form.password);
+      if (!res.ok) setMsg({ type:'error', text:res.message });
+    } else {
+      const res = signup(form);
+      if (!res.ok) setMsg({ type:'error', text:res.message });
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-3">
+      {msg && <div className={`p-2 rounded ${msg.type==='error' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{msg.text}</div>}
+      { mode==='signup' && (
+        <>
+          <input required placeholder="Full name" value={form.name} onChange={e=>setForm({...form,name:e.target.value})} className="w-full border px-3 py-2 rounded" />
+          <select value={form.role} onChange={e=>setForm({...form,role:e.target.value})} className="w-full border px-3 py-2 rounded">
+            <option value="patient">Patient</option>
+            <option value="doctor">Doctor</option>
+            <option value="admin">Admin</option>
+          </select>
+          <input placeholder="Aadhaar (optional for patients)" value={form.aadhaar} onChange={e=>setForm({...form,aadhaar:e.target.value})} className="w-full border px-3 py-2 rounded" />
+        </>
+      )}
+      <input required placeholder="Email" value={form.email} onChange={e=>setForm({...form,email:e.target.value})} className="w-full border px-3 py-2 rounded" />
+      <input required placeholder="Password" value={form.password} onChange={e=>setForm({...form,password:e.target.value})} type="password" className="w-full border px-3 py-2 rounded" />
+      <div className="flex items-center justify-between">
+        <button className="px-4 py-2 bg-indigo-600 text-white rounded">{mode==='login' ? 'Login' : 'Signup'}</button>
+        <button type="button" onClick={()=>setMode(mode==='login'?'signup':'login')} className="text-sm text-indigo-600 underline">
+          { mode==='login' ? 'Create account' : 'Have an account? Login' }
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/* Dashboard - role-based navigation */
+function Dashboard(){
+  const { user } = useAuth();
+  if (!user) return null;
+  if (user.role === 'patient') return <PatientDashboard />;
+  if (user.role === 'doctor') return <DoctorDashboard />;
+  if (user.role === 'admin') return <AdminDashboard />;
+  return <div>Unknown role</div>;
+}
+
+/* Patient Dashboard */
+function PatientDashboard(){
+  const { user } = useAuth();
+  const [dbState, setDBState] = useState(db());
+  useEffect(()=>{ setDBState(db()); }, []);
+  return (
+    <div className="grid md:grid-cols-3 gap-4">
+      <div className="md:col-span-2 space-y-4">
+        <div className="bg-white p-4 rounded shadow">
+          <h3 className="font-semibold">Book Appointment</h3>
+          <AppointmentBooking onBooked={() => setDBState(db())} />
+        </div>
+
+        <div className="bg-white p-4 rounded shadow">
+          <h3 className="font-semibold">Your Appointments</h3>
+          <AppointmentList role="patient" user={user} onUpdate={() => setDBState(db())} />
+        </div>
+
+        <div className="bg-white p-4 rounded shadow">
+          <h3 className="font-semibold">AI Health Chatbot</h3>
+          <Chatbot />
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        <div className="bg-white p-4 rounded shadow">
+          <h3 className="font-semibold">Hospitals Map & Crowd Levels</h3>
+          <MapClusterWidget />
+        </div>
+
+        <div className="bg-white p-4 rounded shadow">
+          <h3 className="font-semibold">Ratings & Reviews</h3>
+          <RatingWidget user={user} />
+        </div>
+
+        <div className="bg-white p-4 rounded shadow">
+          <h3 className="font-semibold">Blood & Organ Donor Check</h3>
+          <DonorSearch />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Doctor Dashboard */
+function DoctorDashboard(){
+  const { user } = useAuth();
+  const dbase = db();
+  const doctor = dbase.doctors.find(x=>x.id===user.doctorId) || dbase.doctors[0];
+  return (
+    <div className="space-y-4">
+      <div className="bg-white p-4 rounded shadow">
+        <h3 className="font-semibold">Doctor Panel — {doctor.name}</h3>
+        <DoctorSlotManager doctor={doctor} />
+      </div>
+      <div className="bg-white p-4 rounded shadow">
+        <h3 className="font-semibold">Manage Appointments</h3>
+        <AppointmentList role="doctor" user={user} />
+      </div>
+      <div className="bg-white p-4 rounded shadow">
+        <h3 className="font-semibold">Map & Hospital Crowd</h3>
+        <MapClusterWidget />
+      </div>
+    </div>
+  );
+}
+
+/* Admin Dashboard */
+function AdminDashboard(){
+  return (
+    <div className="grid md:grid-cols-2 gap-4">
+      <div className="bg-white p-4 rounded shadow">
+        <h3 className="font-semibold">Manage Hospitals & Doctors</h3>
+        <AdminHospitalManager />
+      </div>
+      <div className="bg-white p-4 rounded shadow">
+        <h3 className="font-semibold">Manage Donors & Users</h3>
+        <AdminDonorManager />
+      </div>
+    </div>
+  );
+}
+
+/* Appointment Booking Component (for Patients) */
+function AppointmentBooking({ onBooked }){
+  const { user } = useAuth();
+  const [dbState, setDBState] = useState(db());
+  const [hospitalId, setHospitalId] = useState(dbState.hospitals[0]?.id || '');
+  const [doctorId, setDoctorId] = useState(dbState.doctors[0]?.id || '');
+  const [date, setDate] = useState(daysFromNowISO(0));
+  const [time, setTime] = useState('');
+  const [note, setNote] = useState('');
+  const [msg, setMsg] = useState(null);
+  const [elderFlag, setElderFlag] = useState(false);
+
+  useEffect(()=>{ setDBState(db()); }, []);
+
+  useEffect(()=> {
+    // detect elder if Aadhaar in mapping or stored user aadhaar exists
+    const a = user?.aadhaar;
+    if (a && MOCK.aadhaarMap[a]) {
+      const age = calcAge(MOCK.aadhaarMap[a]);
+      setElderFlag(age >= 75);
+    } else setElderFlag(false);
+  }, [user]);
+
+  const hospitals = dbState.hospitals;
+  const doctors = dbState.doctors.filter(d=>d.hospitalId===hospitalId);
+
+  useEffect(()=> {
+    // auto choose doctor when hospital changes
+    if (doctors.length) setDoctorId(doctors[0].id);
+    else setDoctorId('');
+  }, [hospitalId]);
+
+  // available times: read doctor's slots from DB
+  function getAvailableTimes(docId, dateISO){
+    const dbx = db();
+    const doc = dbx.doctors.find(x=>x.id===docId);
+    if (!doc) return [];
+    const booked = dbx.appointments.filter(a=>a.doctorId===docId && a.date===dateISO && a.status!=='cancelled').map(a=>a.time);
+    const all = doc.slots[dateISO] || [];
+    return all.filter(t=>!booked.includes(t));
+  }
+
+  function handleBook(e){
+    e.preventDefault();
+    if (!doctorId || !date || !time) { setMsg({type:'error', text:'Select doctor, date & time'}); return; }
+    const dbx = db();
+    const newAppt = {
+      id: uid('ap'),
+      patientId: user.id,
+      doctorId,
+      hospitalId,
+      date,
+      time,
+      note,
+      status: 'pending', // doctor can confirm/reject
+      createdAt: new Date().toISOString(),
+      homeVisit: elderFlag // auto mark homeVisit possible if elder
+    };
+    dbx.appointments.push(newAppt);
+    setDB(dbx);
+    setMsg({type:'success', text:'Appointment requested'});
+    setTimeout(()=>{ setMsg(null); }, 2000);
+    if (onBooked) onBooked();
+  }
+
+  useEffect(()=> {
+    setDBState(db());
+    // whenever doctor or date changes, pick first available time
+    if (doctorId && date){
+      const times = getAvailableTimes(doctorId, date);
+      setTime(times[0] || '');
+    }
+  }, [doctorId, date]);
+
+  return (
+    <form onSubmit={handleBook} className="space-y-3">
+      {msg && <div className={`p-2 rounded ${msg.type==='error' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{msg.text}</div>}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+        <select value={hospitalId} onChange={e=>setHospitalId(e.target.value)} className="border px-2 py-2 rounded">
+          {hospitals.map(h=> <option key={h.id} value={h.id}>{h.name}</option>)}
+        </select>
+        <select value={doctorId} onChange={e=>setDoctorId(e.target.value)} className="border px-2 py-2 rounded">
+          {doctors.map(d=> <option key={d.id} value={d.id}>{d.name} — {d.specialization}</option>)}
+        </select>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+        <input type="date" value={date} onChange={e=>setDate(e.target.value)} className="border px-2 py-2 rounded" />
+        <select value={time} onChange={e=>setTime(e.target.value)} className="border px-2 py-2 rounded">
+          <option value="">Select time</option>
+          { getAvailableTimes(doctorId,date).map(t=> <option key={t} value={t}>{t}</option>) }
+        </select>
+      </div>
+
+      <textarea value={note} onChange={e=>setNote(e.target.value)} placeholder="Notes (symptoms, reason...)" className="w-full border px-2 py-2 rounded" />
+
+      <div className="flex items-center justify-between">
+        <div className="text-sm text-gray-600">{elderFlag ? <span className="text-red-600 font-semibold">Elder (75+) — Home visit eligible</span> : 'Not flagged for home visit'}</div>
+        <button className="px-4 py-2 bg-green-600 text-white rounded">Request Appointment</button>
+      </div>
+    </form>
+  );
+}
+
+/* AppointmentList - for patient or doctor */
+function AppointmentList({ role, user, onUpdate }){
+  const [items, setItems] = useState([]);
+  useEffect(()=> setItems(db().appointments), []);
+  useEffect(()=> {
+    const h = setInterval(()=> setItems(db().appointments), 1000);
+    return ()=>clearInterval(h);
+  }, []);
+
+  function doAction(appt, action){
+    const d = db();
+    const idx = d.appointments.findIndex(a=>a.id===appt.id);
+    if (idx===-1) return;
+    if (action==='cancel') d.appointments[idx].status='cancelled';
+    if (action==='confirm') d.appointments[idx].status='confirmed';
+    if (action==='reject') d.appointments[idx].status='rejected';
+    if (action==='reschedule') {
+      const newDate = prompt('Enter new date (YYYY-MM-DD):', appt.date);
+      const newTime = prompt('Enter new time (HH:MM):', appt.time);
+      if (newDate && newTime) { d.appointments[idx].date=newDate; d.appointments[idx].time=newTime; d.appointments[idx].status='pending'; }
+    }
+    setDB(d);
+    setItems(d.appointments);
+    if (onUpdate) onUpdate();
+  }
+
+  const dbase = db();
+  const filtered = items.filter(a => {
+    if (role==='patient') return a.patientId === user.id;
+    if (role==='doctor') {
+      const uDoc = dbase.doctors.find(doc=>doc.id===user.doctorId) || {};
+      return a.doctorId === (user.doctorId || uDoc.id);
+    }
+    return true;
+  });
+
+  return (
+    <div className="space-y-2">
+      { filtered.length===0 && <div className="text-sm text-gray-500">No appointments</div> }
+      { filtered.map(a => {
+        const doc = dbase.doctors.find(d=>d.id===a.doctorId) || {};
+        const hosp = dbase.hospitals.find(h=>h.id===a.hospitalId) || {};
+        const patient = dbase.users.find(u=>u.id===a.patientId) || {};
+        return (
+          <div key={a.id} className="p-2 border rounded flex items-center justify-between">
+            <div>
+              <div className="font-semibold">{doc.name} <span className="text-sm text-gray-500">({doc.specialization})</span></div>
+              <div className="text-sm text-gray-600">{hosp.name} • {a.date} @ {a.time}</div>
+              <div className="text-xs text-gray-500">Status: <strong>{a.status}</strong>{ a.homeVisit ? ' • Home visit requested' : '' }</div>
+              { role==='doctor' && <div className="text-xs text-gray-500">Patient: {patient.name}</div> }
+            </div>
+            <div className="space-x-2">
+              { role==='patient' && a.status!=='cancelled' && <button className="px-2 py-1 rounded bg-yellow-400 text-white text-sm" onClick={()=>doAction(a,'reschedule')}>Reschedule</button> }
+              { role==='patient' && a.status!=='cancelled' && <button className="px-2 py-1 rounded bg-red-500 text-white text-sm" onClick={()=>doAction(a,'cancel')}>Cancel</button> }
+              { role==='doctor' && a.status==='pending' && <>
+                <button className="px-2 py-1 rounded bg-green-600 text-white text-sm" onClick={()=>doAction(a,'confirm')}>Confirm</button>
+                <button className="px-2 py-1 rounded bg-red-500 text-white text-sm" onClick={()=>doAction(a,'reject')}>Reject</button>
+              </> }
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* Doctor Slot Manager */
+function DoctorSlotManager({ doctor }){
+  const [slots, setSlots] = useState(doctor.slots);
+  function addSlot(){
+    const date = prompt('Date (YYYY-MM-DD):', daysFromNowISO(0));
+    const time = prompt('Time (HH:MM):','16:00');
+    if (!date || !time) return;
+    const d = db();
+    const idx = d.doctors.findIndex(x=>x.id===doctor.id);
+    if (idx===-1) return;
+    if (!d.doctors[idx].slots[date]) d.doctors[idx].slots[date] = [];
+    d.doctors[idx].slots[date].push(time);
+    setDB(d);
+    setSlots(d.doctors[idx].slots);
+    alert('Slot added');
+  }
+  return (
+    <div>
+      <div className="text-sm text-gray-600 mb-2">Manage slots (add new slots for availability)</div>
+      <button onClick={addSlot} className="px-3 py-1 bg-indigo-600 text-white rounded">Add Slot</button>
+      <div className="mt-3">
+        { Object.keys(slots).slice(0,7).map(k=> (
+          <div key={k} className="text-sm border p-2 rounded mb-1">
+            <div className="font-semibold">{k}</div>
+            <div className="text-xs text-gray-600">{(slots[k]||[]).join(', ') || 'No slots'}</div>
+          </div>
+        )) }
+      </div>
+    </div>
+  );
+}
+
+/* Map Cluster Widget */
+function MapClusterWidget(){
+  const mapRef = useRef(null);
+  const clusterRef = useRef(null);
+
+  useEffect(()=> {
+    const d = db();
+    const el = document.getElementById('leafletMap');
+    if (!el) return;
+    el.innerHTML = '';
+    const map = L.map(el).setView([12.9716, 77.5946], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution:'' }).addTo(map);
+    const cluster = L.markerClusterGroup();
+    d.hospitals.forEach(h=>{
+      // compute crowd level from appointments
+      const crowdCount = d.appointments.filter(a=>a.hospitalId===h.id && a.date===daysFromNowISO(0) && a.status!=='cancelled').length;
+      const color = crowdCount>4 ? 'red' : crowdCount>1 ? 'orange' : 'green';
+      const marker = L.circleMarker([h.lat,h.lng], { radius:12, fillOpacity:0.8, color: color }).bindPopup(`<b>${h.name}</b><br/>Crowd: ${crowdCount}`);
+      cluster.addLayer(marker);
+    });
+    map.addLayer(cluster);
+    mapRef.current = map;
+    clusterRef.current = cluster;
+    return ()=> { map.remove(); };
+  }, []);
+
+  // we also poll appointments and refresh markers every 2s to simulate dynamic crowd
+  useEffect(()=> {
+    const id = setInterval(()=> {
+      const el = document.getElementById('leafletMap');
+      if (!el || !mapRef.current) return;
+      const map = mapRef.current;
+      const cluster = clusterRef.current;
+      cluster.clearLayers();
+      const d = db();
+      d.hospitals.forEach(h=>{
+        const crowdCount = d.appointments.filter(a=>a.hospitalId===h.id && a.date===daysFromNowISO(0) && a.status!=='cancelled').length;
+        const color = crowdCount>4 ? 'red' : crowdCount>1 ? 'orange' : 'green';
+        const marker = L.circleMarker([h.lat,h.lng], { radius:12, fillOpacity:0.8, color: color }).bindPopup(`<b>${h.name}</b><br/>Crowd: ${crowdCount}`);
+        cluster.addLayer(marker);
+      });
+    }, 2000);
+    return ()=>clearInterval(id);
+  }, []);
+
+  return <div id="leafletMap" className="leaflet-container"></div>;
+}
+
+/* Ratings & Reviews Widget */
+function RatingWidget({ user }){
+  const [dbState, setDBState] = useState(db());
+  const [targetType, setTargetType] = useState('hospital');
+  const [targetId, setTargetId] = useState(dbState.hospitals[0]?.id || '');
+  const [rating, setRating] = useState(5);
+  const [text, setText] = useState('');
+
+  useEffect(()=> setDBState(db()), []);
+
+  function submit(){
+    const d = db();
+    d.reviews.push({ id: uid('r'), userId: user.id, targetType, targetId, rating: Number(rating), text, date:new Date().toISOString() });
+    setDB(d);
+    setDBState(d);
+    setText('');
+    alert('Thanks for your review!');
+  }
+
+  const targets = targetType==='hospital' ? dbState.hospitals : dbState.doctors;
+
+  function getAvgFor(t){
+    const r = dbState.reviews.filter(x=>x.targetType===targetType && x.targetId===t.id);
+    if (!r.length) return { avg:0, count:0 };
+    const s = r.reduce((a,b)=>a+b.rating,0);
+    return { avg: (s/r.length).toFixed(1), count: r.length };
+  }
+
+  return (
+    <div>
+      <div className="mb-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+        <select value={targetType} onChange={e=>{ setTargetType(e.target.value); setTargetId(''); }} className="border px-2 py-2 rounded">
+          <option value="hospital">Hospital</option>
+          <option value="doctor">Doctor</option>
+        </select>
+        <select value={targetId} onChange={e=>setTargetId(e.target.value)} className="border px-2 py-2 rounded">
+          <option value="">Select {targetType}</option>
+          {targets.map(t=> <option key={t.id} value={t.id}>{t.name}</option>)}
+        </select>
+      </div>
+
+      <div className="mb-2">
+        <input type="range" min="1" max="5" value={rating} onChange={e=>setRating(e.target.value)} />
+        <div className="text-sm">Rating: {rating}</div>
+        <textarea value={text} onChange={e=>setText(e.target.value)} placeholder="Write a short review..." className="w-full border px-2 py-2 rounded" />
+        <div className="flex justify-end mt-2">
+          <button onClick={submit} className="px-3 py-1 bg-blue-600 text-white rounded">Submit Review</button>
+        </div>
+      </div>
+
+      <div>
+        <h4 className="font-semibold mb-2">Rating Overview</h4>
+        <div className="space-y-2">
+          { (dbState.hospitals||[]).map(h=>{
+            const s = getAvgFor(h);
+            return <div key={h.id} className="p-2 border rounded flex justify-between"><div>{h.name}</div><div>{s.avg} ⭐ ({s.count})</div></div>;
+          })}
+          { (dbState.doctors||[]).map(d=>{
+            const s = getAvgFor(d);
+            return <div key={d.id} className="p-2 border rounded flex justify-between"><div>{d.name}</div><div>{s.avg} ⭐ ({s.count})</div></div>;
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Donor Search */
+function DonorSearch(){
+  const [blood, setBlood] = useState('');
+  const [location, setLocation] = useState('');
+  const [results, setResults] = useState([]);
+  function search(){
+    const d = db();
+    const res = d.donors.filter(x=> (blood? x.blood===blood : true) && (location ? x.location.toLowerCase().includes(location.toLowerCase()): true));
+    setResults(res);
+  }
+  useEffect(()=> { const d = db(); setResults(d.donors); }, []);
+  return (
+    <div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mb-2">
+        <select value={blood} onChange={e=>setBlood(e.target.value)} className="border px-2 py-2 rounded">
+          <option value="">Any blood</option>
+          <option>A+</option><option>A-</option><option>B+</option><option>B-</option><option>O+</option><option>O-</option><option>AB+</option><option>AB-</option>
+        </select>
+        <input placeholder="Location (text)" value={location} onChange={e=>setLocation(e.target.value)} className="border px-2 py-2 rounded" />
+      </div>
+      <div className="flex justify-between mb-2">
+        <button onClick={search} className="px-3 py-1 bg-green-600 text-white rounded">Search</button>
+        <div className="text-sm text-gray-500">Showing: {results.length} donors</div>
+      </div>
+      <div className="space-y-2">
+        { results.map(r => <div key={r.id} className="p-2 border rounded flex justify-between"><div>{r.name} • {r.blood} • {r.location}</div><div className={`text-sm ${r.available?'text-green-600':'text-red-600'}`}>{r.available ? 'Available':'Not'}</div></div>)}
+      </div>
+    </div>
+  );
+}
+
+/* Chatbot (simple rule-based; can be replaced with OpenAI integration) */
+function Chatbot(){
+  const [input, setInput] = useState('');
+  const [history, setHistory] = useState([]);
+  function send(){
+    if (!input.trim()) return;
+    const userMsg = { id: uid('m'), from:'user', text: input, time:new Date().toISOString() };
+    setHistory(h=>[...h, userMsg]);
+    const rsp = generateBotReply(input);
+    setTimeout(()=> setHistory(h=>[...h, { id: uid('m'), from:'bot', text: rsp, time:new Date().toISOString() }]), 400);
+    setInput('');
+  }
+  return (
+    <div>
+      <div className="h-40 overflow-y-auto border p-2 rounded mb-2">
+        { history.length===0 && <div className="text-sm text-gray-500">Ask the chatbot about symptoms, food suggestions, home remedies.</div> }
+        { history.map(m => <div key={m.id} className={`mb-2 ${m.from==='bot' ? 'text-left':'text-right'}`}><div className={`inline-block p-2 rounded ${m.from==='bot' ? 'bg-gray-100':'bg-indigo-600 text-white'}`}>{m.text}</div></div>)}
+      </div>
+      <div className="flex gap-2">
+        <input value={input} onChange={e=>setInput(e.target.value)} placeholder="Describe symptoms..." className="flex-1 border px-2 py-2 rounded" />
+        <button onClick={send} className="px-3 py-2 bg-indigo-600 text-white rounded">Ask</button>
+      </div>
+    </div>
+  );
+}
+function generateBotReply(text){
+  const s = text.toLowerCase();
+  if (s.includes('fever') || s.includes('temperature')) return "For fever: rest, hydrate, paracetamol if needed. Monitor temperature; see doctor if >38.5°C or persists.";
+  if (s.includes('cough') || s.includes('cold')) return "Cough tips: steam inhalation, warm fluids, honey for adults. Seek doctor if cough is severe or blood present.";
+  if (s.includes('chest') || s.includes('pain')) return "Chest pain could be serious. If severe or accompanied by breathlessness, call emergency services immediately.";
+  if (s.includes('food') || s.includes('diet')) return "Personalized suggestion: eat balanced meals, include proteins and fiber. For digestion: avoid oily foods, prefer light soups and steamed vegetables.";
+  return "I'm a demo chatbot. For this symptom, please consult a doctor. Meanwhile: maintain hydration and rest. Provide more details for tailored suggestions.";
+}
+
+/* Admin Managers */
+function AdminHospitalManager(){
+  const [hospitals, setHospitals] = useState(db().hospitals);
+  const [doctors, setDoctors] = useState(db().doctors);
+
+  function addHospital(){
+    const name = prompt('Hospital name:');
+    const lat = parseFloat(prompt('Latitude:', '12.97'));
+    const lng = parseFloat(prompt('Longitude:', '77.59'));
+    if (!name) return;
+    const d = db();
+    const newH = { id: uid('h'), name, lat, lng, address: '' };
+    d.hospitals.push(newH);
+    setDB(d);
+    setHospitals(d.hospitals);
+    alert('Hospital added');
+  }
+  function addDoctor(){
+    const name = prompt('Doctor name:');
+    const spec = prompt('Specialization:');
+    const hospId = prompt('Hospital ID (pick from list):\n' + db().hospitals.map(h=>h.id+':'+h.name).join('\n'));
+    if (!name) return;
+    const d = db();
+    const newDoc = { id: uid('d'), name, hospitalId: hospId || d.hospitals[0].id, specialization: spec || '', slots: generateSlots() };
+    d.doctors.push(newDoc);
+    setDB(d);
+    setDoctors(d.doctors);
+    alert('Doctor added');
+  }
+
+  return (
+    <div>
+      <div className="mb-2">
+        <button onClick={addHospital} className="px-3 py-1 bg-green-600 text-white rounded mr-2">Add Hospital</button>
+        <button onClick={addDoctor} className="px-3 py-1 bg-indigo-600 text-white rounded">Add Doctor</button>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+        <div>
+          <h4 className="font-semibold">Hospitals</h4>
+          <div className="space-y-2 mt-2">
+            { hospitals.map(h => <div key={h.id} className="p-2 border rounded">{h.name} <div className="text-xs text-gray-500">{h.id}</div></div>)}
+          </div>
+        </div>
+        <div>
+          <h4 className="font-semibold">Doctors</h4>
+          <div className="space-y-2 mt-2">
+            { doctors.map(d => <div key={d.id} className="p-2 border rounded">{d.name} <div className="text-xs text-gray-500">{d.specialization} • {d.hospitalId}</div></div>)}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AdminDonorManager(){
+  const [donors, setDonors] = useState(db().donors);
+  function addDonor(){
+    const name = prompt('Donor name:');
+    const blood = prompt('Blood group:');
+    const loc = prompt('Location:');
+    const d = db();
+    d.donors.push({ id: uid('don'), name, blood, location:loc, available:true });
+    setDB(d);
+    setDonors(d.donors);
+    alert('Donor added');
+  }
+  return (
+    <div>
+      <button onClick={addDonor} className="px-3 py-1 bg-green-600 text-white rounded mb-3">Add Donor</button>
+      <div className="space-y-2">
+        {donors.map(d => <div key={d.id} className="p-2 border rounded flex justify-between"><div>{d.name} • {d.blood} • {d.location}</div><div className={`text-sm ${d.available?'text-green-600':'text-red-600'}`}>{d.available?'Available':'Not'}</div></div>)}
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------
+   Render
+   ------------------------- */
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+</script>
+</body>
+</html>
